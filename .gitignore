@@ -1,0 +1,16 @@
+state/
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.jsonl
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
