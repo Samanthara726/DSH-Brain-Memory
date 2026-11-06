@@ -8,11 +8,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Samanthara726/dsh-brain-memory.git"
+    "url": "git+https://github.com/Samanthara726/DSH-Brain-Memory.git"
   },
-  "homepage": "https://github.com/Samanthara726/dsh-brain-memory#readme",
+  "homepage": "https://github.com/Samanthara726/DSH-Brain-Memory#readme",
   "bugs": {
-    "url": "https://github.com/Samanthara726/dsh-brain-memory/issues"
+    "url": "https://github.com/Samanthara726/DSH-Brain-Memory/issues"
   },
   "main": "./lib/index.js",
   "exports": {
