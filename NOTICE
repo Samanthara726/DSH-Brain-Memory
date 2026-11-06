@@ -1,0 +1,23 @@
+# NOTICE
+
+## 面板（`web/`）的来路
+
+`web/index.html` 与 `web/vendor/` 的视觉与交互部分派生自
+[`dsh-memory-brain-plugin`](https://github.com/1DAdidi/dsh-memory-brain-plugin) 的 `web/` 目录（MIT License）。
+本项目只改了数据源（直接吃记忆服务的 `/graph`）、标题与几处与本项目无关的入口，
+记忆的逻辑、分区与配色都不动。
+
+three.js 以 `web/vendor/three.module.min.js` 形式内联分发（MIT License，© three.js authors）。
+
+## 遗忘曲线
+
+FSRS-5 的公式与默认参数来自
+[open-spaced-repetition](https://github.com/open-spaced-repetition) 的公开规范（MIT）。
+本项目只用了默认参数，没有做参数训练。
+
+## 设计思路参考
+
+- `y083245/dsh-memory-brain`：长记忆账本（long-memory）与到期提醒（life-loop）的思路来源；
+- `dsh-memory-fortress`：分层记忆的早期概念参考。
+
+以上都只借了思路，代码是重写的。

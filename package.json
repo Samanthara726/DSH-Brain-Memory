@@ -1,0 +1,49 @@
+{
+  "name": "dsh-brain-memory",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "把『模拟人脑』记忆系统接到 DSH：FSRS-5 遗忘曲线 + 中文 2-gram + 可选本地向量检索 + 人物账本。独立服务、独立数据库，每轮自动召回注入、回合结束自动落库。",
+  "author": "Samanthara726",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Samanthara726/dsh-brain-memory.git"
+  },
+  "homepage": "https://github.com/Samanthara726/dsh-brain-memory#readme",
+  "bugs": {
+    "url": "https://github.com/Samanthara726/dsh-brain-memory/issues"
+  },
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "server",
+    "docs",
+    "web",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "serve": "python server/memory_service.py",
+    "serve:embed": "python server/embed_service.py",
+    "panel": "node scripts/memory-nebula.mjs",
+    "test": "node test/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

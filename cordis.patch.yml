@@ -1,0 +1,7 @@
+# 一个插件，两条贡献：
+#   1. system-prompt/assemble 瀑布：每轮按「最后一条用户消息」去记忆服务召回，
+#      命中时把带护栏的小块（≤1200 字）追加进动态运行时上下文。
+#   2. agent/settled：回合结束把这一问一答原样落进记忆库（服务端做去重 + 遗忘曲线）。
+- insert:
+    - id: dsh-brain-memory
+      name: dsh-brain-memory
