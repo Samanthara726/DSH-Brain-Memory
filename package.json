@@ -1,9 +1,9 @@
 {
   "name": "dsh-brain-memory",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
-  "description": "把『模拟人脑』记忆系统接到 DSH：FSRS-5 遗忘曲线 + 中文 2-gram + 可选本地向量检索 + 人物账本。独立服务、独立数据库，每轮自动召回注入、回合结束自动落库。",
+  "description": "把『模拟人脑』记忆系统接到 DSH：FSRS-5 遗忘曲线 + 中文 2-gram + 可选本地向量检索 + 人物账本 + 事实键与取代（why / factKey / superseded）。独立服务、独立数据库；长期事实常驻注入，对话流水只进库不进提示。",
   "author": "Samanthara726",
   "license": "MIT",
   "repository": {
@@ -41,7 +41,8 @@
     "serve": "python server/memory_service.py",
     "serve:embed": "python server/embed_service.py",
     "panel": "node scripts/memory-nebula.mjs",
-    "test": "node test/smoke.mjs"
+    "test": "node test/smoke.mjs",
+    "test:factkey": "python test/selftest-memory-factkey.py"
   },
   "engines": {
     "node": ">=20"

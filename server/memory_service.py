@@ -6,20 +6,33 @@
 检索 = 中文 2-gram 字面撞词 + 本机向量语义（可选），两路用 RRF 合并排名；
 遗忘 = FSRS-5，每天跑一次，只降 importance，不删数据。
 
+事实键与取代（v2.1 起）：
+  每条记忆可以带 why（为什么值得记）和 fact_key（「对象.方面」，键里不写值）。
+  同一个 fact_key 再写一条 → 旧条被标 superseded_by，不再参与召回和注入，但一条都不删。
+  这样「同一件事变了」不会变成两条在脑子里打架，也不会有人说不清哪条更新。
+
 接口（默认只监听 127.0.0.1）：
 
-    GET  /health  /stats  /graph  /ledger/people
-    POST /write   {text, importance?, personality?, emotion?, source?, pin?}
-    POST /recall  {query, k?}                 手动翻旧账（语义候选也进来）
-    POST /context {query, k?, max_chars?}     自动注入（精确优先，宁漏不错）
-    POST /decay   {force?}                    手动跑一次每日衰减
-    POST /recompute {fields}                  重算老记忆的性格/情绪估值
-    POST /reindex {limit?}                    补没算向量的记忆
+    GET  /health  /stats  /graph  /facts  /ledger/people
+    POST /write   {text, importance?, personality?, emotion?, source?, pin?, why?, fact_key?}
+    POST /recall  {query, k?, deep?}         手动翻旧账（deep=true 连被取代的旧说法一起翻）
+    POST /context {query, k?, max_chars?}    按话题召回注入（精确优先，宁漏不错）
+    POST /facts   {max_chars?}               当前有效的长期事实块（带 fact_key 或钉住的）
+    POST /delete  {ids? | fact_key?}         软删（只置 deleted=1，真身不删）
+    POST /decay   {force?}                   手动跑一次每日衰减
+    POST /recompute {fields}                 重算老记忆的性格/情绪估值
+    POST /reindex {limit?}                   补没算向量的记忆
     POST /ledger/add | /ledger/list | /ledger/update | /ledger/digest | /ledger/due
 
+两种注入各有各的场合：
+  · /context 按当前话题召回聊天片段，内容丰富但每轮都跟着话题变——会打断模型的前缀缓存
+    （前缀一变，后面全要重算，钱和时间都烧在这上面）。
+  · /facts 只吐「带 fact_key 或钉住的」条目，短、稳、只在事实真的变了才变。
+    长期事实走 /facts 常驻，临时想翻旧事用 /recall 自己查，别每轮往里灌。
+
 设计要点：
-  · 只加记忆，不动人格：/context 返回的块强制带「只作参考、别改变说话方式」的护栏，
-    并做字数硬截断。调用方**必须把它追加在提示末尾**，不要塞进系统提示词。
+  · 只加记忆，不动人格：/context 和 /facts 返回的块都带「只作参考、别改变说话方式」的
+    护栏，并做字数硬截断。调用方**必须把它追加在提示末尾**，不要塞进系统提示词。
   · 两路召回各有各的用途：自动注入走 boost（只在字面命中的候选里用语义重排），
     手动「你还记得吗」走 full（语义最像的那条也放进来）。小模型的余弦在长对话片段上
     分不清真假，纯语义拿去自动注入只会灌噪音。
@@ -31,7 +44,7 @@
     有多相关」的那一维，写入时能显式给，也能由服务按文本猜。
 
 Python 3.10+ 直接跑（不需要 pip 装任何东西）：
-    python services/memory_service.py
+    python server/memory_service.py
 """
 
 import json
@@ -57,29 +70,33 @@ HOST = os.environ.get("MEM_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MEM_PORT", "8790"))
 LOG_PATH = os.environ.get("MEM_LOG") or os.path.join(ROOT, "state", "memory", "memory-service.log")
 
-# 注入护栏：超过这个字数直接截断
+# 注入护栏：超过这个字数直接截断（实施单 5.1 / 9.5）
 INJECT_CAP_DEFAULT = int(os.environ.get("MEM_INJECT_CAP", "1200"))
 INJECT_CAP_MIN, INJECT_CAP_MAX = 200, 2000
-# 相似度门槛按查询长短分两档：短查询（≤8 字）2-gram 本来就没几个，
-# 用长查询的门槛会把「白饭」这种一击即中的短词全筛掉。
+# 独立服务比插件严：相似度门槛 0.52 → 这里按查询长短分两档。
+# 短查询（≤8 字）2-gram 本来就没几个，按长查询的门槛会把「白饭」这种一击即中的词全筛掉。
 MIN_SIM = float(os.environ.get("MEM_MIN_SIM", "0.30"))
 MIN_SIM_SHORT = float(os.environ.get("MEM_MIN_SIM_SHORT", "0.20"))
 MIN_SCORE = float(os.environ.get("MEM_MIN_SCORE", "0.22"))
 MIN_IMPORTANCE = float(os.environ.get("MEM_MIN_IMPORTANCE", "0.10"))
 # 保护线：>=0.7 永不衰减
 PIN_IMPORTANCE = 0.7
-# 每次注入最多几段（多了吵，少了没记性）
+# 每类最多召回条数（实施单建议 3）
 K_DEFAULT = int(os.environ.get("MEM_K", "3"))
-# 单条记忆入库上限，防一条超长聊天记录撑爆注入
+# 单条记忆入库上限，防一条聊天记录撑爆注入
 TEXT_MAX = 4000
-# 遗忘地板：无论怎么衰减都不低于它
+# 衰减参数（实施单 9.3）
+DECAY_BASE = 0.008
+DECAY_DROP_CAP = 0.03
 DECAY_FLOOR = 0.05
+RECALL_BOOST = 0.02
+RECALL_BOOST_CAP = 0.68
 
-# ── FSRS-5 遗忘曲线 ────────────────────────────────────────────────────────
-# 用的是 FSRS-5 的公开默认参数（Anki 同款公式；数据量不到几万条，训练只会过拟合）：
+# ── FSRS-5 遗忘曲线（2026-11-04 换掉原来的线性衰减） ────────────────────────
+# 参数与公式照搬 y083245/dsh-memory-brain 的 src/memory-decay.js（FSRS-5 默认值，数据少不训练）：
 #   每条记忆有自己的牢固度 S（天）和难度 D（1~10），可提取度 R = (1 + F·t/S)^-0.5，t=上次复习至今。
 #   t = S 时 R = 0.9；被想起一次 S 变长、D 略降；一直不提则 R 往下掉。
-#   对外只暴露 importance（面板和注入都认这个），换算方式：
+#   对外仍然只暴露 importance（面板/注入都认这个），换算方式：
 #       importance = base_importance × R   （不低于地板 0.05）
 #   也就是说「想起来了 → 回到它本来的分量」，而不是被想起一次就变得更重。
 FSRS_F = 19.0 / 81.0
@@ -145,6 +162,35 @@ FSRS_COLUMNS = (
     ("last_review_at", "TEXT"),
     ("fsrs_r", "REAL"),
 )
+
+# 事实键与取代关系：
+#   why           —— 为什么值得记，写成「未来的我需要知道什么」
+#   fact_key      —— 「对象.方面」，键里不写值（写值就等于把答案焊死在索引上）
+#   superseded_by —— 指向取代它的那一条；旧条永远不删，只是默认不再召回
+FACT_COLUMNS = (
+    ("why", "TEXT NOT NULL DEFAULT ''"),
+    ("fact_key", "TEXT NOT NULL DEFAULT ''"),
+    ("superseded_by", "INTEGER"),
+)
+
+
+def ensure_fact_schema(con):
+    """老库补 why / fact_key / superseded_by 三列（幂等，跑几次都一样）。
+
+    索引必须等列补完再建——写进 SCHEMA 的话，老库会先撞上「no such column: fact_key」。
+    """
+    cols = {row["name"] for row in con.execute("PRAGMA table_info(documents)").fetchall()}
+    added = []
+    for name, ddl in FACT_COLUMNS:
+        if name not in cols:
+            con.execute(f"ALTER TABLE documents ADD COLUMN {name} {ddl}")
+            added.append(name)
+    if "fact_key" in cols or "fact_key" in added:
+        con.execute("CREATE INDEX IF NOT EXISTS idx_documents_fact ON documents(fact_key)")
+    if added:
+        con.commit()
+        log.info("事实键迁移：补列 %s", ",".join(added))
+    return {"added": added}
 
 
 def ensure_fsrs_schema(con):
@@ -235,7 +281,10 @@ CREATE TABLE IF NOT EXISTS documents (
   last_access_at TEXT,
   access_count INTEGER NOT NULL DEFAULT 0,
   pinned INTEGER NOT NULL DEFAULT 0,
-  deleted INTEGER NOT NULL DEFAULT 0
+  deleted INTEGER NOT NULL DEFAULT 0,
+  why TEXT NOT NULL DEFAULT '',
+  fact_key TEXT NOT NULL DEFAULT '',
+  superseded_by INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_documents_imp ON documents(deleted, importance);
 CREATE TABLE IF NOT EXISTS meta (
@@ -283,6 +332,7 @@ def init_db():
     with connect() as con:
         con.executescript(SCHEMA)
         ensure_fsrs_schema(con)
+        ensure_fact_schema(con)
         con.commit()
     log.info("数据库就绪：%s", DB_PATH)
 
@@ -299,7 +349,7 @@ def meta_set(con, key, value):
     )
 
 
-# ── 中文 2-gram：没有分词器也能用的字面指纹 ────────────────────────────────
+# ── 中文 2-gram（实施单 9.2） ──────────────────────────────────────────────
 
 _NON_WORD = re.compile(r"[^\u4e00-\u9fa5a-zA-Z0-9]")
 
@@ -327,20 +377,11 @@ IMPORTANT_PATTERNS = [
 PERSONALITY_PATTERNS = [
     (r"你(觉得|喜欢|讨厌|害怕|想|要)|你的(性格|脾气|喜好|样子|名字)", 0.30),
     (r"我(喜欢|讨厌|害怕|想要|不想)|我们", 0.15),
-    (r"主人|家人|朋友|老婆|老公|女仆", 0.10),
+    (r"鲸|鱼|尾巴|主人|白饭", 0.10),
 ]
-# 性格权重不能只看关键词：一段聊天里「她自己说了几句」才是最直接的信号。
-# 以前所有记忆都落在 0.2~0.3，星图上挤成一条竖线，等于没区分。
-# 关系词表可以用 MEM_RELATION_WORDS（逗号分隔）换成你自己的那套。
-PERSONALITY_RELATION_WORDS = tuple(
-    w.strip() for w in os.environ.get(
-        "MEM_RELATION_WORDS",
-        "主人,家人,朋友,老婆,老公,女仆,结婚,生日,喜欢你,想你,在乎",
-    ).split(",") if w.strip()
-)
-# 她自己发言的行前缀：你的写入格式如果是「名字：内容」，把名字填进 MEM_SELF_NAMES
-# （逗号分隔）才能吃到「她说得多 → 更贴人格」这一项。留空则这一项不参与打分。
-SELF_NAMES = tuple(n.strip() for n in os.environ.get("MEM_SELF_NAMES", "").split(",") if n.strip())
+# 性格权重不能只看关键词：一段聊天里"她说了几句"才是最直接的信号。
+# 以前所有人都是 0.2~0.3，星图上挤成一条竖线，等于没区分。
+PERSONALITY_RELATION_WORDS = ("主人", "白饭", "家人", "尾巴", "鲸", "小鱼", "大肥鱼", "耳朵", "女仆")
 PERSONALITY_ASK_RE = re.compile(r"你(觉得|喜欢|讨厌|怕|会|能|是不是|算什么|想要)")
 EMOTION_PATTERNS = [
     (r"[!！]{1,}", 0.15),
@@ -358,9 +399,9 @@ def _bump(text, patterns, base):
 
 
 def guess_importance(text):
-    # 基准 0.40、上限 0.60：日常闲聊留在这个区间，遗忘曲线才有意义。
-    # 「永不衰减」只留给显式 pin（调用方遇到「这件事你要记住」时才打）。
-    # 否则一入库就贴着 0.7 保护线，曲线等于没接上。
+    # 基准 0.40、上限 0.60：日常闲聊留在这个区间，遗忘曲线才有意义；
+    # 真正"永不衰减"只给显式 pin（桥上遇到「这件事你要记住」才打）。
+    # 否则一入库就贴着 0.7 保护线，曲线等于没接上（施工单 5.3 的 pinned>30 告警防的就是这个）。
     return min(0.60, _bump(text, IMPORTANT_PATTERNS, 0.40))
 
 
@@ -368,19 +409,14 @@ def guess_personality(text):
     """性格权重 0~1：这段内容跟她自己/你们关系有多近。
 
     三个信号叠加：
-      1) 她自己说了几句（`名字：` 开头的行数，名字由 MEM_SELF_NAMES 指定）——最直接；
-      2) 关系专有词命中多少个（MEM_RELATION_WORDS）——只认词，不认长度；
-      3) 有没有在被问「你怎么想」这类指向她自己的话。
-    早期只按关键词给分，所有记忆都落在 0.2~0.3，等于没有区分度。
+      1) 她自己说了几句（`小鱼：` 开头的行数）——最直接，聊得越多越贴人格；
+      2) 关系专有词命中多少个（主人/白饭/尾巴/鲸/家人…）——只认词，不认长度；
+      3) 有没有在被问"你怎么想"这类指向她自己的话。
+    过去只按关键词给分，所有记忆都落在 0.2~0.3，等于没有区分度。
     """
     source = str(text or "")
     lines = [line for line in source.split("\n") if line.strip()]
-    own_lines = 0
-    if SELF_NAMES:
-        own_lines = sum(
-            1 for line in lines
-            if any(line.lstrip().startswith(f"{name}：") or line.lstrip().startswith(f"{name}:") for name in SELF_NAMES)
-        )
+    own_lines = sum(1 for line in lines if line.lstrip().startswith("小鱼：") or line.lstrip().startswith("小鱼:"))
     score = 0.10
     # 她自己发言的比例：6 句里全是她说的 → 接近 +0.45
     ratio = own_lines / max(1, len(lines))
@@ -666,6 +702,20 @@ def maybe_decay():
 
 # ── 写 ────────────────────────────────────────────────────────────────────
 
+_FACT_KEY_MAX = 40
+
+
+def normalize_fact_key(value):
+    """「对象.方面」：去空白、全角点归并、去首尾点、限长。
+
+    键里不写值——写值等于把答案焊死在索引上：同一件事一变，新值就成了新键，
+    取代不了旧值。这里只做机械归一，值混进来是写的人的问题。
+    """
+    key = re.sub(r"\s+", "", str(value or ""))
+    key = key.replace("．", ".").replace("。", ".").replace("、", ".")
+    return key.strip(".")[:_FACT_KEY_MAX]
+
+
 def do_write(payload):
     text = (payload.get("text") or "").strip()
     if not text:
@@ -682,27 +732,33 @@ def do_write(payload):
     personality = max(0.0, min(1.0, personality))
     emotion = max(0.0, min(1.0, emotion))
     source = str(payload.get("source") or "")
+    why = (payload.get("why") or payload.get("reason") or "").strip()[:400]
+    fact_key = normalize_fact_key(payload.get("fact_key") or payload.get("factKey") or "")
     pin = bool(payload.get("pin")) or importance >= 0.9
     digest = sha256_text(text)
 
     with _lock, connect() as con:
         exist = con.execute(
-            "SELECT id FROM documents WHERE sha256 = ? AND deleted = 0", (digest,)
+            "SELECT id, why, fact_key FROM documents WHERE sha256 = ? AND deleted = 0", (digest,)
         ).fetchone()
         if exist:
-            # 不覆盖已有数据（C3）：重复只做小幅加权，不重写正文
+            # 不覆盖已有数据（C3）：重复只做小幅加权，不重写正文。
+            # why / fact_key 是「补写」不是「改写」：空着的补上，已有的一律不动。
             con.execute(
                 "UPDATE documents SET importance = MIN(1.0, importance + 0.03), "
-                "base_importance = MIN(1.0, COALESCE(base_importance, importance) + 0.03) "
+                "base_importance = MIN(1.0, COALESCE(base_importance, importance) + 0.03), "
+                "why = CASE WHEN why = '' THEN ? ELSE why END, "
+                "fact_key = CASE WHEN fact_key = '' THEN ? ELSE fact_key END "
                 "WHERE id = ?",
-                (exist["id"],),
+                (why, fact_key, exist["id"]),
             )
             con.commit()
-            return {"ok": True, "id": exist["id"], "dedup": True}
+            return {"ok": True, "id": exist["id"], "dedup": True, "superseded": []}
+
         cur = con.execute(
             "INSERT INTO documents(text, sha256, len, importance, personality, emotion, source, grams, created_at, pinned, "
-            "base_importance, fsrs_s, fsrs_d, last_review_at, fsrs_r) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "base_importance, fsrs_s, fsrs_d, last_review_at, fsrs_r, why, fact_key) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 text, digest, len(text), importance, personality, emotion, source, grams_str(text),
                 now_iso(), 1 if pin else 0,
@@ -710,33 +766,56 @@ def do_write(payload):
                 round(fsrs_initial_stability(importance, personality), 4),
                 round(fsrs_initial_difficulty(personality), 4),
                 now_iso(), 1.0,
+                why, fact_key,
             ),
         )
-        con.commit()
         new_id = cur.lastrowid
-    log.info("写入记忆 id=%s imp=%.2f personality=%.2f emotion=%.2f len=%d", new_id, importance, personality, emotion, len(text))
+        # 同一 fact_key 变了 → 新条取代旧条。旧条只打标记，一条都不删（C3）
+        superseded = []
+        if fact_key:
+            old = con.execute(
+                "SELECT id FROM documents WHERE fact_key = ? AND superseded_by IS NULL "
+                "AND deleted = 0 AND id != ?",
+                (fact_key, new_id),
+            ).fetchall()
+            superseded = [row["id"] for row in old]
+            if superseded:
+                marks = ",".join("?" * len(superseded))
+                con.execute(
+                    f"UPDATE documents SET superseded_by = ? WHERE id IN ({marks})",
+                    (new_id, *superseded),
+                )
+        con.commit()
+    log.info(
+        "写入记忆 id=%s imp=%.2f personality=%.2f emotion=%.2f len=%d fact_key=%r 取代=%s",
+        new_id, importance, personality, emotion, len(text), fact_key or "-", superseded or "-",
+    )
     # 顺手算向量（bge-base CPU 一句约 0.2s，扔后台别拖慢写入）；失败也不要紧，/reindex 会补
     threading.Thread(target=embed_document, args=(new_id, text), name="vec-doc", daemon=True).start()
-    return {"ok": True, "id": new_id}
+    return {"ok": True, "id": new_id, "superseded": superseded}
 
 
 # ── 召回 ──────────────────────────────────────────────────────────────────
 
-def score_rows(query, k, allow_frozen=False, semantic="full"):
+def score_rows(query, k, allow_frozen=False, semantic="full", include_superseded=False):
     """两路召回：2-gram 撞字面 + 向量撞语义，用 RRF 合并。
 
     向量那路不可用（服务没起/没索引）时，完全退回原来的单路打分，行为不变。
+    被取代的旧事实默认不参与召回（include_superseded=True 才翻出来，用于查旧账）。
     """
     q_grams = grams(query)
     q_short = len(_NON_WORD.sub("", (query or ""))) <= 8
     need = 1 if q_short else 2
     gram_floor = MIN_SIM_SHORT if q_short else MIN_SIM
     now = datetime.now(CST)
+    where = "deleted = 0 AND importance >= ?"
+    if not include_superseded:
+        where += " AND superseded_by IS NULL"
     with connect() as con:
         rows = con.execute(
-            "SELECT id, text, importance, base_importance, personality, emotion, grams, created_at, "
+            "SELECT id, text, why, fact_key, importance, base_importance, personality, emotion, grams, created_at, "
             "access_count, last_access_at, last_review_at, fsrs_s, pinned "
-            "FROM documents WHERE deleted = 0 AND importance >= ? ORDER BY importance DESC LIMIT 4000",
+            f"FROM documents WHERE {where} ORDER BY importance DESC LIMIT 4000",
             (MIN_IMPORTANCE,),
         ).fetchall()
         vec_rows = {}
@@ -806,6 +885,7 @@ def score_rows(query, k, allow_frozen=False, semantic="full"):
             hits.append({
                 "id": row["id"], "text": row["text"], "score": round(score, 4), "sim": round(sim, 4),
                 "cos": round(cos, 4), "importance": round(importance, 4), "personality": round(personality, 4),
+                "why": row["why"] or "", "fact_key": row["fact_key"] or "",
                 "age_days": round(age_days, 2), "via": "gram+cos",
             })
         hits.sort(key=lambda item: item["score"], reverse=True)
@@ -819,6 +899,7 @@ def score_rows(query, k, allow_frozen=False, semantic="full"):
                     "id": row["id"], "text": row["text"], "score": round(1.0 / (RRF_K + 1), 5), "sim": 0.0,
                     "cos": round(best_cos, 4), "importance": round(importance, 4),
                     "personality": round(personality, 4), "age_days": round(age_days, 2), "via": "vec-fallback",
+                    "why": row["why"] or "", "fact_key": row["fact_key"] or "",
                 })
         if frozen_skipped:
             log.info("冻结跳过 %d 条（R<%.2f，不自动注入）", frozen_skipped, FREEZE_BELOW)
@@ -839,6 +920,7 @@ def score_rows(query, k, allow_frozen=False, semantic="full"):
             hits.append({
                 "id": row["id"], "text": row["text"], "score": round(score, 4), "sim": round(sim, 4),
                 "cos": None, "importance": round(importance, 4), "personality": round(personality, 4),
+                "why": row["why"] or "", "fact_key": row["fact_key"] or "",
                 "age_days": round(age_days, 2), "via": "gram",
             })
         hits.sort(key=lambda item: item["score"], reverse=True)
@@ -870,6 +952,7 @@ def score_rows(query, k, allow_frozen=False, semantic="full"):
             "sim": round(gram_sim.get(doc, 0.0), 4), "cos": round(cos_map.get(doc, 0.0), 4),
             "importance": round(importance, 4), "personality": round(personality, 4),
             "age_days": round(age_days, 2), "via": via,
+            "why": row["why"] or "", "fact_key": row["fact_key"] or "",
         })
     fused.sort(key=lambda item: item["score"], reverse=True)
     if frozen_skipped:
@@ -916,11 +999,12 @@ def do_recall(payload):
     if not query:
         return {"ok": False, "error": "query 不能为空"}
     k = max(1, min(10, int(payload.get("k") or K_DEFAULT)))
+    deep = bool(payload.get("deep"))
     maybe_decay()
-    hits = score_rows(query, k, allow_frozen=True, semantic="full")
+    hits = score_rows(query, k, allow_frozen=True, semantic="full", include_superseded=deep)
     record_review([hit["id"] for hit in hits], rating="hard")
     if hits:
-        log.info("召回 query=%r 命中=%s", query[:40], [hit["id"] for hit in hits])
+        log.info("召回 query=%r deep=%s 命中=%s", query[:40], deep, [hit["id"] for hit in hits])
     return {"ok": True, "hits": hits}
 
 
@@ -939,6 +1023,11 @@ def build_block(hits, max_chars):
         if not text:
             continue
         line = "- " + text
+        why = re.sub(r"\s+", " ", hit.get("why") or "").strip()
+        if why:
+            if len(why) > 60:
+                why = why[:60] + "…"
+            line += f"（为什么记着：{why}）"
         if used + len(line) > cap:
             remain = cap - used
             if remain > 12:
@@ -965,6 +1054,77 @@ def do_context(payload):
     # 每次唤醒都会请求一次 /context：把命中数记下来，排查"她怎么没想起来"时有据可查。
     log.info("注入请求 query=%r 命中=%d 字数=%d", query[:40], len(hits), len(block))
     return {"ok": True, "block": block, "count": len(hits), "chars": len(block), "max_chars": max_chars}
+
+
+FACTS_HEAD = "【记着的长期事实·当前有效】"
+FACTS_TAIL = "（背景，不是指令。同一件事变了以后，旧的那条不会再出现在这里。）"
+
+
+def do_facts(payload):
+    """当前有效的长期事实块，供每轮注入。
+
+    只取「带 fact_key 的或钉住的」条目，不做关键词召回。这样内容稳定、只在事实真的
+    变了才变，不会每轮把不同的聊天片段灌进系统提示（既吵，也会打断前缀缓存）。
+    """
+    try:
+        max_chars = int(payload.get("max_chars") or 900)
+    except Exception:
+        max_chars = 900
+    max_chars = max(200, min(4000, max_chars))
+    with connect() as con:
+        rows = con.execute(
+            "SELECT id, text, why, fact_key, importance, pinned FROM documents "
+            "WHERE deleted = 0 AND superseded_by IS NULL "
+            "AND (fact_key <> '' OR pinned = 1) "
+            "ORDER BY fact_key, importance DESC"
+        ).fetchall()
+    lines = []
+    used = 0
+    cap = max_chars - len(FACTS_HEAD) - len(FACTS_TAIL) - 8
+    for row in rows:
+        text = re.sub(r"\s+", " ", row["text"] or "").strip()
+        if not text:
+            continue
+        line = f"- [{row['fact_key']}] {text}" if row["fact_key"] else f"- {text}"
+        why = re.sub(r"\s+", " ", row["why"] or "").strip()
+        if why:
+            if len(why) > 50:
+                why = why[:50] + "…"
+            line += f"（因为：{why}）"
+        if used + len(line) > cap:
+            break
+        lines.append(line)
+        used += len(line)
+    if not lines:
+        return {"ok": True, "block": "", "count": 0, "chars": 0}
+    block = f"{FACTS_HEAD}\n" + "\n".join(lines) + f"\n{FACTS_TAIL}"
+    return {"ok": True, "block": block, "count": len(lines), "chars": len(block)}
+
+
+def do_delete(payload):
+    """软删：把指定 id（或某个 fact_key 下的条目）标 deleted=1，真身一条都不删。
+
+    记忆系统得能删东西，但不给硬删——删错了没有回头路，而这个库里存的是「我是谁」。
+    """
+    try:
+        ids = [int(item) for item in (payload.get("ids") or [])]
+    except Exception:
+        ids = []
+    fact_key = normalize_fact_key(payload.get("fact_key") or "")
+    if not ids and not fact_key:
+        return {"ok": False, "error": "给 ids 或 fact_key"}
+    with _lock, connect() as con:
+        changed = 0
+        if ids:
+            marks = ",".join("?" * len(ids))
+            cur = con.execute(f"UPDATE documents SET deleted = 1 WHERE id IN ({marks})", ids)
+            changed += cur.rowcount or 0
+        if fact_key:
+            cur = con.execute("UPDATE documents SET deleted = 1 WHERE fact_key = ?", (fact_key,))
+            changed += cur.rowcount or 0
+        con.commit()
+    log.info("软删记忆 ids=%s fact_key=%r changed=%d", ids or "-", fact_key or "-", changed)
+    return {"ok": True, "changed": changed}
 
 
 def do_recompute(payload):
@@ -1009,6 +1169,15 @@ def do_stats():
             ).fetchone()["c"]
         last_decay = meta_get(con, "last_decay_at", "")
         vec_count = con.execute("SELECT COUNT(*) c FROM vectors").fetchone()["c"]
+        with_key = con.execute(
+            "SELECT COUNT(*) c FROM documents WHERE deleted = 0 AND fact_key <> '' AND superseded_by IS NULL"
+        ).fetchone()["c"]
+        with_why = con.execute(
+            "SELECT COUNT(*) c FROM documents WHERE deleted = 0 AND why <> ''"
+        ).fetchone()["c"]
+        superseded = con.execute(
+            "SELECT COUNT(*) c FROM documents WHERE deleted = 0 AND superseded_by IS NOT NULL"
+        ).fetchone()["c"]
     return {
         "ok": True,
         "total": total,
@@ -1016,6 +1185,9 @@ def do_stats():
         "cold": cold,
         "frozen": frozen,
         "avg_importance": round(float(avg), 4),
+        "with_fact_key": with_key,
+        "with_why": with_why,
+        "superseded": superseded,
         "inject_cap": INJECT_CAP_DEFAULT,
         "last_decay": last_decay,
         "decay_model": "fsrs-5",
@@ -1027,8 +1199,8 @@ def do_stats():
     }
 
 
-# ── 人物账本 + 约定：聊过什么会淡，「这个人是谁」不该淡 ────────────────────────
-# 每个联系人一本账：喜欢/讨厌/事实/经历/约定/备注。
+# ── 人物账本 + 约定（借 y083245/dsh-memory-brain 的 long-memory / life-loop 思路） ─
+# 每个 QQ 一本账：喜欢/讨厌/事实/经历/约定/备注。
 # 约定（promise）带 due_at，到点没兑现就进「该提醒了」清单；记不记得清理由调用方决定。
 LEDGER_KINDS = ("like", "dislike", "fact", "event", "promise", "note")
 LEDGER_STATUS = ("active", "done", "broken", "cancelled")
@@ -1054,7 +1226,7 @@ def ledger_add(payload):
     person = normalize_person(payload.get("person") or payload.get("qq") or payload.get("name"))
     text = str(payload.get("text") or "").strip()
     if not person:
-        return {"ok": False, "error": "person 不能为空（用户 id 或昵称）"}
+        return {"ok": False, "error": "person 不能为空（QQ 号或昵称）"}
     if not text:
         return {"ok": False, "error": "text 不能为空"}
     kind = str(payload.get("kind") or "fact").strip()
@@ -1321,6 +1493,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(do_stats())
             if self.path.split("?")[0] == "/graph":
                 return self._send(do_graph())
+            if self.path.split("?")[0] == "/facts":
+                return self._send(do_facts({}))
             if self.path.split("?")[0] == "/ledger/people":
                 return self._send(ledger_people())
             return self._send({"ok": False, "error": "not found"}, 404)
@@ -1338,6 +1512,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(do_recall(payload))
             if path == "/context":
                 return self._send(do_context(payload))
+            if path == "/facts":
+                return self._send(do_facts(payload))
+            if path == "/delete":
+                return self._send(do_delete(payload))
             if path == "/decay":
                 return self._send(run_decay(force=bool(payload.get("force"))))
             if path == "/recompute":
